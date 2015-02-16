@@ -2067,7 +2067,21 @@ public class JCESecurityModule extends BaseSMAdapter {
 		byte[] clearDataByte = decryptDESedeCBCNoPadding(
 				dataUnderDuk.getPINBlock(), tdeskey);
 
-		return ISOUtil.hexString(clearDataByte);
+		return ISOUtil.hexString(stripZeroPadding(clearDataByte));
+	}
+
+	public byte[] stripZeroPadding(byte[] data) {
+		int lastZeroByte = -1;
+		for (int i = 0; i < data.length; i++) {
+			if (data[i] == 0)
+				lastZeroByte = i;
+			else
+				break;
+		}
+		if (lastZeroByte >= 0 && lastZeroByte < (data.length - 1))
+			System.arraycopy(data, lastZeroByte + 1, data, 0, data.length
+					- lastZeroByte - 1);
+		return data;
 	}
 
 	// TODO: clean this up to use the routine that comes w/ jPOS
@@ -2081,6 +2095,23 @@ public class JCESecurityModule extends BaseSMAdapter {
 			Key k = new SecretKeySpec(key, "DESede");
 			Cipher c = Cipher.getInstance("DESede/CBC/NoPadding");
 			c.init(Cipher.DECRYPT_MODE, k, new IvParameterSpec(new byte[8]));
+			return c.doFinal(data);
+		} catch (Exception e) {
+			throw new JCEHandlerException(e);
+		}
+	}
+
+	// TODO: clean this up to use the routine that comes w/ jPOS
+	public byte[] encryptDESedeCBCNoPadding(byte[] data, byte[] key)
+			throws JCEHandlerException {
+
+		if (data == null || key == null)
+			return null;
+
+		try {
+			Key k = new SecretKeySpec(key, "DESede");
+			Cipher c = Cipher.getInstance("DESede/CBC/NoPadding");
+			c.init(Cipher.ENCRYPT_MODE, k, new IvParameterSpec(new byte[8]));
 			return c.doFinal(data);
 		} catch (Exception e) {
 			throw new JCEHandlerException(e);
