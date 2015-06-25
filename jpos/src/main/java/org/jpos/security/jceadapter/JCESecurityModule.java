@@ -2078,9 +2078,13 @@ public class JCESecurityModule extends BaseSMAdapter {
 			else
 				break;
 		}
-		if (lastZeroByte >= 0 && lastZeroByte < (data.length - 1))
-			System.arraycopy(data, lastZeroByte + 1, data, 0, data.length
+
+		if (lastZeroByte >= 0 && lastZeroByte < (data.length - 1)) {
+			byte[] response = new byte[data.length - lastZeroByte - 1];
+			System.arraycopy(data, lastZeroByte + 1, response, 0, data.length
 					- lastZeroByte - 1);
+			return response;
+		}
 		return data;
 	}
 
