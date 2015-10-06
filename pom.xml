@@ -178,7 +178,7 @@
   </dependencies>
 
   <build>
-    <sourceDirectory>${basedir}/jpos/src/main</sourceDirectory>
+    <sourceDirectory>${basedir}/jpos/src/main/java</sourceDirectory>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

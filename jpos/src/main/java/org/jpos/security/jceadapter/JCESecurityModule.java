@@ -20,21 +20,18 @@ package  org.jpos.security.jceadapter;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import org.jpos.core.Configuration;
-import org.jpos.core.ConfigurationException;
-import org.jpos.iso.ISOUtil;
-import org.jpos.security.*;
-import org.jpos.util.LogEvent;
-import org.jpos.util.Logger;
-import org.jpos.util.SimpleMsg;
-
-import javax.crypto.SecretKey;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.security.*;
+import java.security.InvalidKeyException;
+import java.security.Key;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
+import java.security.SecureRandom;
+import java.security.Security;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
@@ -43,9 +40,33 @@ import java.util.Properties;
 import java.util.Random;
 import java.util.StringTokenizer;
 import java.util.TreeMap;
+
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
 import org.javatuples.Pair;
+import org.jpos.core.Configuration;
+import org.jpos.core.ConfigurationException;
 import org.jpos.iso.ISODate;
 import org.jpos.iso.ISOException;
+import org.jpos.iso.ISOUtil;
+import org.jpos.security.BaseSMAdapter;
+import org.jpos.security.EncryptedPIN;
+import org.jpos.security.KeyScheme;
+import org.jpos.security.KeySerialNumber;
+import org.jpos.security.MKDMethod;
+import org.jpos.security.PaddingMethod;
+import org.jpos.security.SKDMethod;
+import org.jpos.security.SMAdapter;
+import org.jpos.security.SMException;
+import org.jpos.security.SecureDESKey;
+import org.jpos.security.Util;
+import org.jpos.security.WeakPINException;
+import org.jpos.util.LogEvent;
+import org.jpos.util.Logger;
+import org.jpos.util.SimpleMsg;
 
 
 /**
@@ -1681,9 +1702,9 @@ public class JCESecurityModule extends BaseSMAdapter {
         byte[] keyR = new byte[8];
         System.arraycopy(key, 0, keyL, 0, 8);
         System.arraycopy(key, 8, keyR, 0, 8);
-        data = decrypt64(data, keyL);
-        data = encrypt64(data, keyR);
-        data = decrypt64(data, keyL);
+		data = decrypt64(data, keyL);
+		data = encrypt64(data, keyR);
+		data = decrypt64(data, keyL);
         return data;
     }
 
@@ -1744,12 +1765,51 @@ public class JCESecurityModule extends BaseSMAdapter {
         return false;
     }
 
-    private byte[] calculateInitialKey(KeySerialNumber sn, SecureDESKey bdk, boolean tdes)
+    private byte[] calculateInitialKey(KeySerialNumber sn, SecureDESKey bdk, boolean tdes) throws SMException {
+        return calculateInitialKey(sn, bdk, tdes, true);
+    }
+
+    // @formatter:off
+    /**
+     * BDK prep:
+     *   1) get raw bdk (its stored encrypted by LMK)
+     *   2) kl = first 8 bytes of bdk; kr = last 8 bytes of bdk
+     * KSN prep:
+     *   3) padleft ksn with 'F' until its 20 hex
+     *   4) ksn = take first 16 hex of padded ksn (so FFFF + 12 bytes)
+     *   5) ksn[7] = ksn[7] & 0xE0
+     * Compute data:
+     *   6) data = encrypt ksn using kl; encrypt result using kr; encrypt result using kl
+     * Compute data2 (if tdes == true):
+     *   7) kl2 = kl XOR C0C0C0C000000000
+     *   8) kr2 = kr XOR C0C0C0C000000000
+     *   9) data2 = encrypt ksn using kl2; encrypt result using kr2; encrypt result using kl2
+     * Compute Initial Key:
+     *  10) first 8 bytes of data + first 8 bytes of data2 (if tdes == true)
+     * 
+     * @param sn
+     * @param bdk
+     * @param tdes
+     * @return
+     * @throws SMException
+     */
+    // @formatter:on
+    private byte[] calculateInitialKey(KeySerialNumber sn, SecureDESKey bdk,
+			boolean tdes, boolean bdkUnderLmk)
             throws SMException
     {
         byte[] kl = new byte[8];
         byte[] kr = new byte[8];
-        byte[] kk = decryptFromLMK(bdk).getEncoded();
+
+        // [fayez, 2015-02-09] enable raw bdk instead of one encrypted under lmk
+        byte[] kk = null;
+        if (bdkUnderLmk)
+            kk = decryptFromLMK(bdk).getEncoded();
+        else {
+            kk = bdk.getKeyBytes();
+            kk = jceHandler.formDESKey(bdk.getKeyLength(), kk).getEncoded();
+        }
+        // [fayez, 2015-02-09] end
 
         System.arraycopy(kk, 0, kl, 0, 8);
         System.arraycopy(kk, 8, kr, 0, 8);
@@ -1790,10 +1850,11 @@ public class JCESecurityModule extends BaseSMAdapter {
         return data;
     }
 
-    private byte[] calculateDerivedKey(KeySerialNumber ksn, SecureDESKey bdk, boolean tdes, boolean dataEncryption)
+    public byte[] calculateDerivedKey(KeySerialNumber ksn, SecureDESKey bdk,
+				       boolean tdes, boolean dataEncryption, boolean bdkUnderLmk)
             throws SMException
     {
-        return tdes?calculateDerivedKeyTDES(ksn,bdk, dataEncryption):calculateDerivedKeySDES(ksn,bdk);
+        return tdes ? calculateDerivedKeyTDES(ksn, bdk, dataEncryption, bdkUnderLmk):calculateDerivedKeySDES(ksn, bdk);
     }
 
     private byte[] calculateDerivedKeySDES(KeySerialNumber ksn, SecureDESKey bdk)
@@ -1832,7 +1893,24 @@ public class JCESecurityModule extends BaseSMAdapter {
         curkey[7] ^= 0xFF;
         return curkey;
     }
-    private byte[] calculateDerivedKeyTDES(KeySerialNumber ksn, SecureDESKey bdk, boolean dataEncryption)
+
+    // @formatter:off
+    /**
+     * 1) compute initialKey using bdk and ksn
+     * 2) smidr = ksn in byte
+     * 3) reg3 = txn counter & 1FFFFF
+     * 4) smidr & E00000
+     * 5)
+     * 
+     * @param ksn
+     * @param bdk
+     * @param dataEncryption
+     * @return
+     * @throws SMException
+     */
+    // @formatter:on
+    private byte[] calculateDerivedKeyTDES(KeySerialNumber ksn,
+			SecureDESKey bdk, boolean dataEncryption, boolean bdkUnderLmk)
             throws SMException
     {
         final byte[] _1FFFFF =
@@ -1842,7 +1920,7 @@ public class JCESecurityModule extends BaseSMAdapter {
         final byte[] _E00000 =
                 new byte[]{(byte) 0xE0, (byte) 0x00, (byte) 0x00};
 
-        byte[] curkey = calculateInitialKey(ksn, bdk, true);
+        byte[] curkey = calculateInitialKey(ksn, bdk, true, bdkUnderLmk);
 
         byte[] smidr = ISOUtil.hex2byte(
                 ksn.getBaseKeyID() + ksn.getDeviceID() + ksn.getTransactionCounter()
@@ -1887,8 +1965,11 @@ public class JCESecurityModule extends BaseSMAdapter {
         while (notZero(shiftr));
 
         if (dataEncryption) {
+            // XOR with variant
             curkey[5] ^= 0xFF;
             curkey[13] ^= 0xFF;
+
+            // encrypt with itself
             System.arraycopy(curkey, 0, curkeyL, 0, 8);
             System.arraycopy(curkey, 8, curkeyR, 0, 8);
             byte[] L = encrypt64(curkeyL, curkeyL);
@@ -1901,6 +1982,7 @@ public class JCESecurityModule extends BaseSMAdapter {
             System.arraycopy (L, 0, curkey, 0, 8);
             System.arraycopy (R, 0, curkey, 8, 8);
         } else {
+            // XOR with variant
             curkey[7] ^= 0xFF;
             curkey[15] ^= 0xFF;
         }
@@ -1939,7 +2021,7 @@ public class JCESecurityModule extends BaseSMAdapter {
              SecureDESKey bdk, SecureDESKey kd2, byte destinationPINBlockFormat,boolean tdes)
             throws SMException
     {
-        byte[] derivedKey = calculateDerivedKey(ksn, bdk, tdes, false);
+        byte[] derivedKey = calculateDerivedKey(ksn, bdk, tdes, false, true);
         byte[] clearPinblk = specialDecrypt(
                 pinUnderDuk.getPINBlock(), derivedKey
         );
@@ -1954,19 +2036,112 @@ public class JCESecurityModule extends BaseSMAdapter {
         );
         return new EncryptedPIN(translatedPinblk, destinationPINBlockFormat, pan,false);
     }
+
+	/**
+	 * Using bdk and ksn, first derives the key. Then uses the key to decrypt
+	 * data.
+	 * 
+	 * @param dataUnderDuk
+	 * @param ksn
+	 * @param bdk
+	 * @param tdes
+	 * @return data in hex string form
+	 * @throws SMException
+	 */
+	protected String decryptDataImpl(EncryptedPIN dataUnderDuk,
+			KeySerialNumber ksn, SecureDESKey bdk, boolean tdes,
+			boolean bdkUnderLmk)
+			throws SMException {
+		byte[] derivedKey = calculateDerivedKey(ksn, bdk, tdes, true,
+				bdkUnderLmk);
+
+		// byte[] clearDataByte = specialDecrypt(dataUnderDuk.getPINBlock(),
+		// derivedKey, true);
+
+		// TODO: implementing my own decrypt routine for DESede/CBD/NoPadding
+		// clean this up to use the routines in jPOS
+		byte[] tdeskey = new byte[24];
+		System.arraycopy(derivedKey, 0, tdeskey, 0, 16);
+		System.arraycopy(derivedKey, 0, tdeskey, 16, 8);
+
+		byte[] clearDataByte = decryptDESedeCBCNoPadding(
+				dataUnderDuk.getPINBlock(), tdeskey);
+
+		return ISOUtil.hexString(stripZeroPadding(clearDataByte));
+	}
+
+	public byte[] stripZeroPadding(byte[] data) {
+		int lastZeroByte = -1;
+		for (int i = 0; i < data.length; i++) {
+			if (data[i] == 0)
+				lastZeroByte = i;
+			else
+				break;
+		}
+
+		if (lastZeroByte >= 0 && lastZeroByte < (data.length - 1)) {
+			byte[] response = new byte[data.length - lastZeroByte - 1];
+			System.arraycopy(data, lastZeroByte + 1, response, 0, data.length
+					- lastZeroByte - 1);
+			return response;
+		}
+		return data;
+	}
+
+	// TODO: clean this up to use the routine that comes w/ jPOS
+	public byte[] decryptDESedeCBCNoPadding(byte[] data, byte[] key)
+			throws JCEHandlerException {
+
+		if (data == null || key == null)
+			return null;
+
+		try {
+			Key k = new SecretKeySpec(key, "DESede");
+			Cipher c = Cipher.getInstance("DESede/CBC/NoPadding");
+			c.init(Cipher.DECRYPT_MODE, k, new IvParameterSpec(new byte[8]));
+			return c.doFinal(data);
+		} catch (Exception e) {
+			throw new JCEHandlerException(e);
+		}
+	}
+
+	// TODO: clean this up to use the routine that comes w/ jPOS
+	public byte[] encryptDESedeCBCNoPadding(byte[] data, byte[] key)
+			throws JCEHandlerException {
+
+		if (data == null || key == null)
+			return null;
+
+		try {
+			Key k = new SecretKeySpec(key, "DESede");
+			Cipher c = Cipher.getInstance("DESede/CBC/NoPadding");
+			c.init(Cipher.ENCRYPT_MODE, k, new IvParameterSpec(new byte[8]));
+			return c.doFinal(data);
+		} catch (Exception e) {
+			throw new JCEHandlerException(e);
+		}
+	}
+
+	protected String decryptPINImpl(EncryptedPIN pinUnderDuk,
+			KeySerialNumber ksn, SecureDESKey bdk, boolean tdes,
+			boolean bdkUnderLmk)
+			throws SMException {
+		byte[] derivedKey = calculateDerivedKey(ksn, bdk, tdes, false,
+				bdkUnderLmk);
+		byte[] clearPinblk = specialDecrypt(pinUnderDuk.getPINBlock(),
+				derivedKey);
+    	
+    	String pan = pinUnderDuk.getAccountNumber();
+    	return calculatePIN(
+    			clearPinblk, pinUnderDuk.getPINBlockFormat(), pan);
+    }
+    
     protected EncryptedPIN importPINImpl
             (EncryptedPIN pinUnderDuk, KeySerialNumber ksn, SecureDESKey bdk,boolean tdes)
             throws SMException
     {
-        byte[] derivedKey = calculateDerivedKey(ksn, bdk,tdes, false);
-        byte[] clearPinblk = specialDecrypt(
-                pinUnderDuk.getPINBlock(), derivedKey
-        );
         String pan = pinUnderDuk.getAccountNumber();
-        String pin = calculatePIN(
-                clearPinblk, pinUnderDuk.getPINBlockFormat(), pan
-        );
-
+        String pin = decryptPINImpl(pinUnderDuk, ksn, bdk, tdes, true);
         byte[] pinUnderLmk = jceHandler.encryptData(
                 calculatePINBlock(pin, SMAdapter.FORMAT00, pan),
                 getLMK(PINLMKIndex)
@@ -1987,5 +2162,52 @@ public class JCESecurityModule extends BaseSMAdapter {
             throws SMException
     {
         return importPINImpl(pinUnderDuk,ksn,bdk,tdes);
+    }
+    
+    // @formatter:off
+    /**
+     * Return raw pin from pin encrypted using DUKPT
+     *  - uses bdk and ksn to derive the key for this transaction
+     *  - uses derived key to decrypt pin-block
+     *  - uses account number (PAN) to get pin from pin-block
+     * 
+     * WARNING: raw pin in software is a security concern
+     * 
+     * @param pinUnderDuk
+     * @param ksn
+     * @param bdk
+     * @param tdes
+     * @return
+     * @throws SMException
+     */
+    // @formatter:on
+    public String decryptPIN(EncryptedPIN pinUnderDuk, KeySerialNumber ksn,
+			     SecureDESKey bdk, boolean tdes, boolean bdkUnderLmk)
+    				throws SMException
+    {
+		return decryptPINImpl(pinUnderDuk, ksn, bdk, tdes, bdkUnderLmk);
+    }
+
+    // @formatter:off
+    /**
+     * Return raw pin from pin encrypted using DUKPT
+     *   - uses bdk and ksn to derive the key for this transaction
+     *   - uses derived key to decrypt pin-block
+     *   - uses account number (PAN) to get pin from pin-block
+     * 
+     * WARNING: raw pin in software is a security concern
+     * 
+     * @param pinUnderDuk
+     * @param ksn
+     * @param bdk
+     * @param tdes
+     * @return
+     * @throws SMException
+     */
+    // @formatter:on
+    public String decryptData(EncryptedPIN dataUnderDuk, KeySerialNumber ksn,
+			SecureDESKey bdk, boolean tdes, boolean bdkUnderLmk)
+			throws SMException {
+		return decryptDataImpl(dataUnderDuk, ksn, bdk, tdes, bdkUnderLmk);
     }
 }

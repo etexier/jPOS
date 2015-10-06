@@ -76,7 +76,7 @@ allprojects {
         }
     }
     signing {
-        required { !isSnapshot }
+        required { !isSnapshot && false }
         sign configurations.archives
     }
     configure(install.repositories.mavenInstaller) {
